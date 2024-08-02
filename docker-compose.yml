@@ -3,5 +3,7 @@ services:
     image: timescale/timescaledb:latest-pg16
     ports:
       - 5432:5432
+    volumes:
+      - "./timescaledb-init/:/docker-entrypoint-initdb.d/"
     environment:
       - POSTGRES_PASSWORD=password

@@ -15,11 +15,11 @@
       - PostProc.Velocity: nullable float
     - Tag keys:
       - assetId: str
-      - assetClass: enum[HeatingDemand, ResidualHeatSource, Pipe] <-- Is always the same per assetId, also a. Perhaps add an asset metadata normal SQL table?
-      - assetName: str <-- Is always the same per assetId. Perhaps add an asset metadata normal SQL table?
-      - capability: enum[Consumer, Producer, Transport] <-- Is always the same per assetId. Perhaps add an asset metadata normal SQL table?
-      - simulationRun: str <-- Constant per output esdl. Perhaps add in a separate metadata normal SQL table?
-      - simulation_type: str <-- Constant per output esdl. Perhaps add in a separate metadata normal SQL table?
+      - assetClass: enum[HeatingDemand, ResidualHeatSource, Pipe] <-- Is always the same per assetId. Perhaps add an asset metadata normal SQL table? <-- Why does this exist? Shouldn't this just be retrieved from the ESDL?
+      - assetName: str <-- Is always the same per assetId. Perhaps add an asset metadata normal SQL table? <-- Why does this exist? Shouldn't this just be retrieved from the ESDL?
+      - capability: enum[Consumer, Producer, Transport] <-- Is always the same per assetId. Perhaps add an asset metadata normal SQL table? <-- Why does this exist? Shouldn't this just be retrieved from the ESDL?
+      - simulationRun: str <-- Constant per output esdl. Perhaps add in a separate metadata normal SQL table? <-- Why does this exist? Shouldn't this just be retrieved from the ESDL? 
+      - simulation_type: str <-- Constant per output esdl. Perhaps add in a separate metadata normal SQL table? <-- Why does this exist? Shouldn't this just be retrieved from the ESDL? 
 
 - Time + AssetId makes a unique row.
 - A asset is only available within a single carrier_id.
@@ -355,38 +355,106 @@ a schema which exists within a database.
 - Database: constant name: esdl_profiles
   - Schema: format_version of the schema used.
     - Per ESDL:
-      - Table for metadata: <esdl_id>.metadata    This is the equivalent of adding an arbitrary tag in influxdb that is constant for the whole profile.
+      - Table for metadata: <esdl_id>_metadata    This is the equivalent of adding an arbitrary tag in influxdb that is constant for the whole profile. <-- Why does this exist? Shouldn't this just be retrieved from the ESDL?
         - Columns (which are mostly dynamic!):
           - name: str <-- primary key e.g. simulation_run or simulation_type 
           - value: str
-      - Table for asset metadata: <esdl_id>.asset_metadata  This is the equivalent of adding an arbitrary tag in influxdb that is constant per asset in the profile.
+      - Table for asset metadata: <esdl_id>_asset_metadata  This is the equivalent of adding an arbitrary tag in influxdb that is constant per asset in the profile. <-- Why does this exist? Shouldn't this just be retrieved from the ESDL?
         - Columns:
           - asset_id (primary key)
           - asset_class: enum[HeatingDemand, ResidualHeatSource, Pipe]
           - asset_name: str
           - capability: enum[Consumer, Producer, Transport]
-      - Hypertable for profiles: <esdl_id>.profiles   This is the equivalent of all values for each profile in influxdb.
+          - carrier_id: str
+      - Hypertable for profiles: <esdl_id>_profiles   This is the equivalent of all values for each profile in influxdb.
         - Chunk interval:
         - Dimensions:
         - Columns (which are mostly dynamic!):
           - time (primary key)  <-- always there
           - asset_id (primary key) <-- always there
-          - carrier_id <-- always there
           - HeatIn.Q: nullable float <-- dynamic, example
           - Heat_flow: nullable float <-- dynamic, example
           - PostProc.Velocity: nullable float <-- dynamic, example
           - ... other dynamic columns
 
+
+
+
+## Retention
+It is important to be able to remove unneeded data from the database. Due to the chosen format,
+there is a neat package of 3 tables that describe a single ESDL. Removing the data for a single
+ESDL would entail removing all 3 tables.
+
+While 1 table is a hypertable, setting a retention policy would remove the data but not the table.
+Also it would operate per chunk and we have chosen to keep all data for up to 10 years in a single
+chunk. A retention policy in Timescaledb would remove old data on a per-chunk basis. 
+
+The 2 other tables are normal SQL table and they require a manual `DROP TABLE` operation.
+
+Therefore, retention should be handled manually. The ESDL package should provide an easy
+'delete profiles for ESDL' operation that removes the 3 tables for a single ESDL from the
+database.
+
+## Scaling
 Why use a single table for all profiles instead of having a hypertable per kpi?
 Otherwise we would have to write joins or create multiple queries to group results together in the 
 case of a graph which shows multiple assets. TimescaleDB allows for segmentation & ordering on
 compression & we can add an index to help the hypertable for single asset and/or single carrier
 queries while still having the flexibility of querying multiple assets with a single query.
 It also prevents many chunks from being created as all profiles are kept together in the same chunk.
-Each chunk will host data for ~a year (perhaps a couple). Assuming a double precision is used for
-15 minute intervals, we would expect ~35.040 data points per profile per year which amounts to
-~275 KB per profile per year of data. TimescaleDB reckons to keep chunk sizes smaller than 25% of RAM
-but still as large as possible to prevent chunks from being swapped in and out.
-All in all, this leads to 2 considerations: 1) Utilize a single hypertable for all profiles within an
-ESDL and 2) Set the (chunk) time interval of the hypertable to 10 years. 
+Each chunk will host data for ~1 year (perhaps a couple). Assuming a double precision (8 bytes) is used for
+15 minute intervals, we would expect ~35.040 data points per profile per asset per year which amounts to
+~275 KB per profile per asset per year of data. TimescaleDB reckons to keep chunk sizes smaller
+than 25% of PostgreSQL RAM allocation but still as large as possible to prevent chunks from being
+swapped in and out. All in all, this leads to 2 considerations: 1) Utilize a single hypertable for all
+profiles within an ESDL and 2) Set the (chunk) time interval of the hypertable to 1 years.
+
+See https://www.timescale.com/blog/timescale-cloud-tips-testing-your-chunk-size/ for chunk
+size recommendations.
+
+Plusses:
+- Queries within a single ESDL are fast and require only a single chunk to be read.
+- Data is retained as an per-ESDL unit so dropping chunks/tables is easy.
+- Only 1 chunk is expected to be created for most ESDLs as the interval is set to 1 years.
+
+Downsides:
+- Queries across multiple ESDLs and/or multiple years would require multiple chunks to be read.
+  However, the only practical solution for this would be to dump all data from all ESDLs into a
+  single table which would be disastrous due to chunking. We expect queries to be mostly on a
+  per-ESDL basis so this downside is expected not to happen too often.
+
+## Worst-case analysis
+Assume an ESDL with 500 assets and 20 distinct KPI profiles running up to 5 years with a 15 minute
+resolution. The chunk would become `500 assets * 20 profiles * 5 years * 275KB = ~13,1GB`.
+While an ESDL may quickly grow (adding a pipe always adds a return pipe which
+results in 2 assets added) 500 assets would be on the large side. 20 profiles would also be on
+the high side but not unreasonable. For instance, a single simulation may be interested in
+pressure, flowrate, temperature, heat-loss and heat-transferred KPI's and perhaps a number of
+financial KPI's may be added as well. 5 years may be unreasonable for our current purposes.
+Simulating or optimizing over multiple years may not make sense as a single year may just
+be repeated multiple years. A time resolution of 15 minutes is considered very detailed, but
+hourly is considered normal.
+
+13,1GB of data for a single ESDL is unreasonable even though the input parameters aren't.
+Therefor, we need to protect the architecture against generating this much data in the first place.
+Therefor, we recommend an upper limit of 1GB per ESDL of data. This would ensure that queries
+across 5 ESDLs (scenarios) would lead to the concurrent reading of 5GB of data.
+
+
+A lot of profile information maybe generated with the threshold at `1GB`. For instance, assuming a
+more average 250 assets, 10 profiles for 1 year leads to `671MB` of data.
+
+Using the recommendation of 25% of PostgreSQL RAM allocation of all active chunks, it would lead to at least
+4GB for PostgreSQL in a production deployment for a single concurrent user. However, to be safe, we will recommend 32GB of RAM
+for PostgreSQL memory allocation due to concurrent users.
+
+Check with simulation AND optimization teams:
+- Would we always optimize/simulate up to a year? Or also for multiple years?
+- What would be the lowest expected time resolution for optimization/simulation? 1 hour? 15 minutes? 
+  Does the resolution matter for the total timespan of the simulation?
+- How many assets do you expect to exist at most in an ESDL?
+- How many KPI profiles do you expect to generate at most?
+- When a user views the data, which time spans would they be expected to use? Multiple years?
+  Within a day? Within an hour? Within a month?
+
 
