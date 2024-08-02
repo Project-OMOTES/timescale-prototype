@@ -404,10 +404,12 @@ queries while still having the flexibility of querying multiple assets with a si
 It also prevents many chunks from being created as all profiles are kept together in the same chunk.
 Each chunk will host data for ~1 year (perhaps a couple). Assuming a double precision (8 bytes) is used for
 15 minute intervals, we would expect ~35.040 data points per profile per asset per year which amounts to
-~275 KB per profile per asset per year of data. TimescaleDB reckons to keep chunk sizes smaller
-than 25% of PostgreSQL RAM allocation but still as large as possible to prevent chunks from being
-swapped in and out. All in all, this leads to 2 considerations: 1) Utilize a single hypertable for all
-profiles within an ESDL and 2) Set the (chunk) time interval of the hypertable to 1 years.
+~275 KB per profile per asset per year of data. Also we need to account for the asset id which is
+32 bytes and the datetime which is 8 bytes, both per data point. This equals to 1,34MB per asset per year.
+TimescaleDB reckons to keep chunk sizes smaller than 25% of PostgreSQL RAM allocation but still as large
+as possible to prevent chunks from being swapped in and out. All in all, this leads to 2
+considerations: 1) Utilize a single hypertable for all profiles within an ESDL and 2) Set the 
+(chunk) time interval of the hypertable to 1 years.
 
 See https://www.timescale.com/blog/timescale-cloud-tips-testing-your-chunk-size/ for chunk
 size recommendations.
@@ -442,12 +444,24 @@ across 5 ESDLs (scenarios) would lead to the concurrent reading of 5GB of data.
 
 
 A lot of profile information maybe generated with the threshold at `1GB`. For instance, assuming a
-more average 250 assets, 10 profiles for 1 year leads to `671MB` of data.
+more average 250 assets, 10 profiles for 1 year leads to `1006MB` of data.
 
 Using the recommendation of 25% of PostgreSQL RAM allocation of all active chunks, it would lead to at least
 4GB for PostgreSQL in a production deployment for a single concurrent user. However, to be safe, we will recommend 32GB of RAM
 for PostgreSQL memory allocation due to concurrent users.
 
+
+## Optimization
+As the access patterns expect that a profile will be retrieved per asset, it is advised to create
+an index on the `asset_id` column on the `<esdl_id>_profiles` hypertable. This will allow
+PostgreSQL to be very fast on retrieving all rows that are associated with some `asset_id` as
+opposed to performing a table scan. A quick check on laptop showed an improvement from 480ms
+down to 22ms on the query `select "HeatIn.Q1" from "47ba5e2e-dbed-40b2-bfa7-ae10bec48bcb_profiles" where asset_id='0540ea6a-88ef-4d24-b015-d7e34aa999f2';`
+where the `<esdl_id>_profiles` table contained a year profile on 15 minute resolution for 250 assets
+with 10 KPI profiles in total.
+
+
+# TODO
 Check with simulation AND optimization teams:
 - Would we always optimize/simulate up to a year? Or also for multiple years?
 - What would be the lowest expected time resolution for optimization/simulation? 1 hour? 15 minutes? 
@@ -457,4 +471,11 @@ Check with simulation AND optimization teams:
 - When a user views the data, which time spans would they be expected to use? Multiple years?
   Within a day? Within an hour? Within a month?
 
+Check with ESDL team:
+- Are id's always uuids? If so, we can save some storage by setting the appropriate columns to uuid type!
 
+Work on myself:
+In current setup, the performance to add a column is going to suck if the table is already large.
+Query would be similar to `insert ... where asset_id='...' and time='...'` and would need
+to be performed e.g. 35040 / as many data points as there are. 
+Adding data for a new asset is fine as it would lead to completely new rows.

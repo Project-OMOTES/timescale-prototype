@@ -2,10 +2,10 @@ import datetime
 import random
 import uuid
 
-NUM_OF_ASSETS = 10
-KPIs = ["HeatIn.Q1", "Heat_flow1", "PostProc.Velocity1", "HeatIn.Q2", "Heat_flow2", "PostProc.Velocity2"]
+NUM_OF_ASSETS = 250
+KPIs = ["HeatIn.Q1", "Heat_flow1", "PostProc.Velocity1", "HeatIn.Q2", "Heat_flow2", "PostProc.Velocity2", "HeatIn.Q3", "Heat_flow3", "PostProc.Velocity3", "HeatIn.Q4"]
 START_DATETIME = datetime.datetime.fromisoformat('2020-01-01T00:00:00+00:00')
-END_DATETIME = datetime.datetime.fromisoformat('2020-01-01T03:00:00+00:00')
+END_DATETIME = datetime.datetime.fromisoformat('2021-01-01T00:00:00+00:00')
 RESOLUTION = datetime.timedelta(minutes=15)
 
 
@@ -61,32 +61,33 @@ set schema 'esdl_profiles_v1';
 CREATE TABLE "{esdl_id}_profiles" (
     time TIMESTAMPTZ,
     asset_id TEXT,
-    {'\n    '.join(f'"{kpi}" real,' for kpi in KPIs)}
-    PRIMARY KEY (time, asset_id)
+    {',\n    '.join(f'"{kpi}" real' for kpi in KPIs)}
 );
 
 SELECT public.create_hypertable('{esdl_id}_profiles', public.by_range('time', INTERVAL '1 year'));
 
-INSERT INTO "{esdl_id}_profiles" VALUES
 ''')
 
+    def write_insert(rows_):
+        if rows_:
+            open_profiles_file.write(f'INSERT INTO "{esdl_id}_profiles" VALUES\n')
+
+            for row_i, row in enumerate(rows_):
+                if row_i == len(rows_) - 1:
+                    end_line = ';\n'
+                else:
+                    end_line = ',\n'
+                open_profiles_file.write(f"    {row}{end_line}")
+
+    rows = []
     for asset_i, asset_id in enumerate(asset_ids):
         current_time = START_DATETIME
         while current_time < END_DATETIME:
-            next_current_time = current_time + RESOLUTION
+            rows.append(f"('{current_time.isoformat(sep=' ')}', '{asset_id}', {', '.join(str(random.uniform(0, 10)) for _ in KPIs)})")
+            current_time += RESOLUTION
 
-            if next_current_time >= END_DATETIME:
-                end_line = ''
-            else:
-                end_line = ',\n'
+            if len(rows) % 1000 == 0:
+                write_insert(rows)
+                rows = []
 
-            open_profiles_file.write(f"    ('{current_time.isoformat(sep=' ')}', '{asset_id}', {', '.join(str(random.uniform(0, 10)) for _ in KPIs)}){end_line}")
-            current_time = next_current_time
-
-        if asset_i == len(asset_ids) - 1:
-            open_profiles_file.write(';\n')
-        else:
-            open_profiles_file.write(',\n')
-
-
-
+    write_insert(rows)
