@@ -306,7 +306,7 @@ We should therefore mostly optimize for queries as writes happen very little.
 Type of current queries:
 
 - Datastructure should allow all (KPI) profiles of an ESDL to exist in multiple format versions.
-- An ESDL will reference a single profile consisting of all measurements for 1 KPI/profile column within a single carrier for a single asset.
+- An ESDL will reference a single profile consisting of all measurements for 1 KPI/profile column for a single asset.
   - Profiles are written per KPI/profile column, per carrier per asset
   - Profiles are read per KPI/profile column, per carrier per asset
 
@@ -316,6 +316,10 @@ Future, expected queries:
 - Query for multiple years, but aggregate to time buckets of days
 - Query for a week, but keep data as detailed as possible.
 
+
+Type of inserts:
+- Add profile data per asset per KPI profile.
+- Add all profiles for a single asset.
   
 # Considerations
 - Basic system admin maintenance (auto vacuum should be fine): https://www.timescale.com/learn/how-to-reduce-bloat-in-large-postgresql-tables
@@ -332,6 +336,11 @@ Future, expected queries:
 - Proper indexing for hypertables: https://docs.timescale.com/use-timescale/latest/schema-management/about-indexing/
 - ESDL may have multiple versions, but there also may be multiple versions of this format.
   - This is especially useful to update enums. Enums are created within the scope of a schema.
+
+
+- Dots `.` aren't allowed in PostgreSQL table names and such. Therefor, we convert dots in profiles names to `_`.
+- PostgreSQL allows table names to only be up to 63 characters. Therefore, we need to ensure that table names cannot grow larger. A single UUID is already 36 characters we can include a maximum of a single UUID.
+
 
 ## Authorization & authentication
 We expect that access is granted on a minimum of 'per-ESDL' profiles. In other words,
@@ -370,15 +379,78 @@ a schema which exists within a database.
         - Chunk interval:
         - Dimensions:
         - Columns (which are mostly dynamic!):
-          - time (primary key)  <-- always there
-          - asset_id (primary key) <-- always there
+          - time  <-- always there
+          - asset_id <-- always there
           - HeatIn.Q: nullable float <-- dynamic, example
           - Heat_flow: nullable float <-- dynamic, example
           - PostProc.Velocity: nullable float <-- dynamic, example
           - ... other dynamic columns
+        - Do not add a primary key on time & asset_id. Index is 2/3 of the size of the table.
 
 
+Options:
 
+- Single table with all profiles with a column describing to which profile each row belongs
+  - Duplicate asset_id value `#values per profile * #profiles` times.
+  - Duplicate time column `#assets * #profiles` times.
+  - Requires indexes in order to maintain performance.
+- Table per esdl & profile/kpi
+  - Quite a few tables
+  - Duplicate time column `#assets * #profiles` times.
+  - Duplicate asset_id value `#values per profile * #profiles` times.
+  - Requires an asset_id index to maintain performance.
+- Table per esdl, asset_id & profile/KPI
+  - Duplicate time column `#assets * #profiles` times.
+  - Asset id is not duplicated.
+  - Lots and lots of tables.
+  - No indices required to maintain performance, however joins are required to correlate data across assets, profiles or ESDL's.
+
+
+Ideal space usage:
+```
+250 assets * 10 KPIs == 2500 profiles.
+Each profile has 15 minute per day == 96 points per day or 35040 values per year.
+
+Ideally, the asset_id is repeated once per profile (16 bytes per asset_id 2500 times), each value
+(4 bytes per value) is only written once (so 2500 * 35040 = 87.600.000 values) and the time column (8 bytes per timestamp) is only
+repeated once (so 35040 values). 
+
+This adds up to ~335MB of data ideally/minimally.
+
+InfluxDB uses 1.5GB to store this test data set.
+```
+
+| Characteristic                                              | Table per ESDL, asset_id & profile/KPI                                             | Table per ESDL & asset_id, KPI as columns                                                                                                     | Single table for all profiles per ESDL with asset_id as a column value and KPI as column name (InfluxDB-equivalent)                                 | Single table for all profiles per ESDL with asset_id & KPI concatted in column name | Single table for all profiles per ESDL with asset_id & KPI as column (values) |
+|-------------------------------------------------------------|------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------|-------------------------------------------------------------------------------|
+| # of tables per ESDL                                        | `#KPI * #assets + 2` / 2502                                                        | `#assets + 2` / 252                                                                                                                           | 3                                                                                                                                                   | 3                                                                                   | 3                                                                             |
+| # of columns in profile table                               | 2 (time & value)                                                                   | `# KPI` / 10                                                                                                                                  | `# KPI` / 10                                                                                                                                        | `# KPI * #assets` / 2500                                                            | 4                                                                             |
+| # of time values per ESDL (8 byte each)                     | `#KPI * #assets * #profile_values` / 87.600.000                                    | `#assets * #profile_values` / 8.760.000                                                                                                       | `#assets * #profile_values` / 8.760.000                                                                                                             | `#profile_values` / 35040                                                           | `#KPI * #assets * #profile_values` / 87.600.000                               |
+| # of asset_id values per ESDL (16 byte each)                | 0                                                                                  | 0                                                                                                                                             | `#assets * #profile_values` / 8.760.000                                                                                                             | `#assets * #KPI` / 2500                                                             | `#KPI * #assets * #profile_values` / 87.600.000                               |
+| # of rows / ideal bytes for 250 assets, 10 KPIs single ESDL | `#KPI * #assets * #profile_values` / 87.600.000 / 1 GB                             | `#assets * #profile_values` / 8.760.000 / ~401MB                                                                                              | `#assets * #profile_values` / 8.760.000 / ~535MB                                                                                                    | `#profile_values` / 35040 / ~335MB                                                  | `#KPI * #assets * #profile_values` / 87.600.000 / ~2.28GB                     |
+| Amount of storage it actually took                          | ~3.7GB (no hypertable)                                                             | ~662MB (no hypertable)                                                                                                                        | ~981MB (no hypertable) / ~1.1GB (as hypertable)                                                                                                     | Cannot test                                                                         | 8.5GB (as hyptertable)                                                        |
+| Query speed for retrieving single profile for single asset  | Untested                                                                           | +++ (2-6ms)                                                                                                                                   | ++ (requires index) (~6-10ms) without index ~700ms                                                                                                  | Cannot test                                                                         | Untested (would require multiple indices)                                     |
+| Query speed for retrieving single profile for 2 assets      | Untested                                                                           | +++ (25-30ms, using a join)                                                                                                                   |                                                                                                                                                     | Cannot test                                                                         | Untested (would require multiple indices)                                     |
+| Comments                                                    | Results in a LOT of tables per ESDL. Unsure if PSQL can handle this for many ESDLs | Hard to add a profile as we would need to insert a column and update each row in a separate transaction. Use schema per ESDL & format version | Requires an index for querying on asset_id. Hard to add a profile as we would need to insert a column and update each row in a separate transaction | Doesn't work, tables can have atmost 1600 columns                                   | Easy to add a profile to existing data                                        |
+
+
+## Benchmarking PSQL with Table per ESDL & asset_id, KPI as columns vs. InfluxDB v1.8
+Storage comparisons between postgresql (661 MB in optimized format, ~1GB in flexible format) & 
+influxdb (1.5GB). Also did some queries where I retrieved all profiles for every asset (250) for a 
+single KPI. With Postgresql (using optimized format) I compare 2 methods where we retrieve all 
+data using a single join query (takes ~14 seconds) or by retrieving each profile individually 
+(takes ~5.6 seconds). With Influxdb there is only 1 way and it takes 66 seconds (of which 
+processing at Influxdb takes ~20 seconds  and the other 40 seconds is parsing & processing by the 
+Python library). Also worthy to note is that memory usage of PostgreSQL stays low (~600MB for 
+method and ~1.6GB for method 2) and all memory is released after while influxdb jumps up to ~6GB.
+
+## Advise production deployment PSQL
+CPU: 4+
+Memory: 32GB+
+Disk: 2TB+
+Network: 1Gbps+
+
+Ensure that the connections between PSQL & OMOTES and PSQL & the frontend is fast and has a low
+latency. ESDL profiles can be large and the database will generate a lot of traffic.
 
 ## Retention
 It is important to be able to remove unneeded data from the database. Due to the chosen format,
@@ -458,7 +530,8 @@ PostgreSQL to be very fast on retrieving all rows that are associated with some 
 opposed to performing a table scan. A quick check on laptop showed an improvement from 480ms
 down to 22ms on the query `select "HeatIn.Q1" from "47ba5e2e-dbed-40b2-bfa7-ae10bec48bcb_profiles" where asset_id='0540ea6a-88ef-4d24-b015-d7e34aa999f2';`
 where the `<esdl_id>_profiles` table contained a year profile on 15 minute resolution for 250 assets
-with 10 KPI profiles in total.
+with 10 KPI profiles in total. Adding such an index introduces 7,5% extra storage used which
+appears acceptable.
 
 
 # TODO
@@ -473,9 +546,5 @@ Check with simulation AND optimization teams:
 
 Check with ESDL team:
 - Are id's always uuids? If so, we can save some storage by setting the appropriate columns to uuid type!
-
-Work on myself:
-In current setup, the performance to add a column is going to suck if the table is already large.
-Query would be similar to `insert ... where asset_id='...' and time='...'` and would need
-to be performed e.g. 35040 / as many data points as there are. 
-Adding data for a new asset is fine as it would lead to completely new rows.
+- Do assets always only have 1 carrier? (Would expect so).
+- Do we ever need to add a single profile to an already existing ESDL? I would expect not as all data is available when the ESDL is created. New profile -> new ESDL
